@@ -5,18 +5,36 @@
 //   GET  /prices    → Yahoo Finance batch quotes
 //   GET  /news      → Yahoo Finance RSS headlines per symbol
 
+// Only the dashboard may call this worker. The Anthropic route spends real
+// money, so it also pins the model and caps the size of every request.
+const ALLOWED_ORIGINS = [
+  "https://geminiceo.netlify.app",
+  /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/,
+];
+const MODEL = "claude-haiku-4-5-20251001";
+const MAX_TOKENS = 2000;
+const MAX_BODY_BYTES = 32_000;
+
+function allowedOrigin(origin) {
+  if (!origin) return null;
+  return ALLOWED_ORIGINS.some((o) => (typeof o === "string" ? o === origin : o.test(origin))) ? origin : null;
+}
+
 export default {
   async fetch(request, env) {
+    const origin = allowedOrigin(request.headers.get("Origin"));
 
     // ── CORS preflight ──────────────────────────────────────────────────────
     if (request.method === "OPTIONS") {
+      if (!origin) return new Response(null, { status: 403 });
       return new Response(null, {
         status: 204,
         headers: {
-          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Origin": origin,
           "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
           "Access-Control-Allow-Headers": "Content-Type",
           "Access-Control-Max-Age": "86400",
+          "Vary": "Origin",
         },
       });
     }
@@ -24,8 +42,9 @@ export default {
     const url = new URL(request.url);
 
     const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Origin": origin || "https://geminiceo.netlify.app",
       "Content-Type": "application/json",
+      "Vary": "Origin",
     };
 
     // ── GET /calendar — ForexFactory live data ──────────────────────────────
@@ -118,9 +137,23 @@ export default {
 
     // ── POST / — Anthropic API proxy ────────────────────────────────────────
     if (request.method === "POST") {
+      // Browsers always send Origin on a cross-site POST, so a missing or
+      // foreign one means the call didn't come from the dashboard.
+      if (!origin) {
+        return new Response(JSON.stringify({ error: { message: "Forbidden" } }), { status: 403, headers: corsHeaders });
+      }
       try {
-        const body = await request.json();
+        const raw = await request.text();
+        if (raw.length > MAX_BODY_BYTES) {
+          return new Response(JSON.stringify({ error: { message: "Request too large" } }), { status: 413, headers: corsHeaders });
+        }
+        const body = JSON.parse(raw);
+        if (!Array.isArray(body.messages) || body.messages.length === 0 || body.messages.length > 4) {
+          return new Response(JSON.stringify({ error: { message: "Bad request" } }), { status: 400, headers: corsHeaders });
+        }
 
+        // Forward only the fields the dashboard uses, with the model pinned
+        // and the output capped, whatever the caller asked for.
         const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: {
@@ -128,7 +161,12 @@ export default {
             "x-api-key": env.ANTHROPIC_API_KEY,
             "anthropic-version": "2023-06-01",
           },
-          body: JSON.stringify(body),
+          body: JSON.stringify({
+            model: MODEL,
+            max_tokens: Math.min(Number(body.max_tokens) || 1500, MAX_TOKENS),
+            ...(typeof body.system === "string" ? { system: body.system } : {}),
+            messages: body.messages,
+          }),
         });
 
         // Read body as text first so we can handle non-JSON error pages
