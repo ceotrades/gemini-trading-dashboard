@@ -1,0 +1,22 @@
+{
+  "name": "GEMINI Trading",
+  "short_name": "GEMINI",
+  "description": "AI-powered trading dashboard",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#08090B",
+  "theme_color": "#08090B",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "https://via.placeholder.com/192x192/00CFFF/000000?text=G",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://via.placeholder.com/512x512/00CFFF/000000?text=G",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

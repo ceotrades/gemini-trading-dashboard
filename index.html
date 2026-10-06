@@ -1,0 +1,1396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="theme-color" content="#08090B"/>
+  <title>GEMINI</title>
+  <link rel="manifest" href="manifest.json"/>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>* { box-sizing: border-box; margin: 0; padding: 0; } html, body { background: #08090B; min-height: 100vh; }</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/plain" id="app-source">
+
+const { useState, useEffect, useRef, useCallback } = React;
+
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+const CLAUDE_API = "https://jolly-cake-682f.dhruv-kapoorr.workers.dev";
+const USER_NAME = "Dhruv";
+
+const ALL_AVAILABLE_ASSETS = [
+  "EUR/USD","GBP/USD","USD/JPY","XAU/USD","US30","NAS100","BTC/USD","OIL/USD",
+  "USD/CAD","AUD/USD","EUR/AUD","AUD/USD","EUR/GBP","GBP/JPY","USD/CHF",
+  "EUR/JPY","GBP/AUD","AUD/JPY","XAG/USD","ETH/USD","US500","GER40","UK100"
+];
+
+const DEFAULT_MACRO_ASSETS  = ["XAU/USD","NAS100","EUR/USD","GBP/USD"];
+const DEFAULT_BRIEF_ASSETS  = ["EUR/USD","GBP/USD","XAU/USD","NAS100","BTC/USD","OIL/USD"];
+
+const SESSIONS_DEF = [
+  { name:"LONDON",   tz:"Europe/London",   open:8,  close:17 },
+  { name:"NEW YORK", tz:"America/New_York", open:9,  close:17 },
+  { name:"SYDNEY",   tz:"Australia/Sydney", open:9,  close:17 },
+  { name:"ASIA",     tz:"Asia/Tokyo",       open:9,  close:17 },
+];
+
+// Universal API call — no custom headers, works on all browsers including mobile Safari
+async function callClaude(system, user, maxTokens = 1500) {
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), 45000);
+  try {
+    const res = await fetch(CLAUDE_API, {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: maxTokens,
+        system,
+        messages: [{ role: "user", content: user }],
+      }),
+    });
+    clearTimeout(tid);
+    // Always read JSON body first — the worker always returns JSON even on errors
+    let data;
+    try { data = await res.json(); } catch { throw new Error(`Worker returned non-JSON (HTTP ${res.status})`); }
+    if (!res.ok || data.error) throw new Error(data.error?.message || `HTTP ${res.status}`);
+    return data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+  } catch (e) {
+    clearTimeout(tid);
+    if (e.name === "AbortError") throw new Error("Request timed out. Check your connection and tap Refresh.");
+    throw e;
+  }
+}
+
+// Alias — both use same function now
+const callClaudeFast = (system, user) => callClaude(system, user, 1500);
+
+// ─── Yahoo Finance symbol map ─────────────────────────────────────────────────
+const YAHOO_MAP = {
+  "EUR/USD":"EURUSD=X","GBP/USD":"GBPUSD=X","USD/JPY":"USDJPY=X",
+  "XAU/USD":"GC=F","NAS100":"NQ=F","US30":"YM=F","US500":"ES=F",
+  "BTC/USD":"BTC-USD","ETH/USD":"ETH-USD","OIL/USD":"CL=F",
+  "USD/CAD":"USDCAD=X","AUD/USD":"AUDUSD=X","EUR/AUD":"EURAUD=X",
+  "EUR/GBP":"EURGBP=X","GBP/JPY":"GBPJPY=X","USD/CHF":"USDCHF=X",
+  "EUR/JPY":"EURJPY=X","GBP/AUD":"GBPAUD=X","AUD/JPY":"AUDJPY=X",
+  "XAG/USD":"SI=F","GER40":"^GDAXI","UK100":"^FTSE",
+};
+
+function fmtPrice(pair, p) {
+  if (p == null) return "—";
+  if (["XAU/USD","US30","NAS100","US500","BTC/USD","ETH/USD"].includes(pair))
+    return p.toLocaleString("en-US",{minimumFractionDigits:0,maximumFractionDigits:2});
+  if (["USD/JPY","GBP/JPY","EUR/JPY","AUD/JPY"].includes(pair)) return p.toFixed(2);
+  return p.toFixed(4);
+}
+
+async function fetchLivePrices(assets) {
+  try {
+    const syms = assets.map(a => YAHOO_MAP[a]).filter(Boolean).join(",");
+    if (!syms) return {};
+    const res = await fetch(`${CLAUDE_API}/prices?symbols=${encodeURIComponent(syms)}`);
+    if (!res.ok) return {};
+    const data = await res.json();
+    if (data.error) return {};
+    const out = {};
+    assets.forEach(a => {
+      const ys = YAHOO_MAP[a];
+      const q = ys && data[ys];
+      if (q && q.price != null) {
+        const pct = q.changePercent || 0;
+        out[a] = { price: fmtPrice(a, q.price), changePercent: pct, change: (pct>=0?"+":"")+pct.toFixed(2)+"%", up: pct>=0 };
+      }
+    });
+    return out;
+  } catch { return {}; }
+}
+
+async function fetchNewsHeadlines(asset) {
+  try {
+    const sym = YAHOO_MAP[asset];
+    if (!sym) return [];
+    const res = await fetch(`${CLAUDE_API}/news?symbol=${encodeURIComponent(sym)}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.headlines || [];
+  } catch { return []; }
+}
+
+function getHour(tz) {
+  return parseInt(new Intl.DateTimeFormat("en-US",{hour:"numeric",hour12:false,timeZone:tz}).format(new Date()));
+}
+
+function getGreeting() {
+  const h = new Date().getHours();
+  if (h < 12) return "Good morning";
+  if (h < 17) return "Good afternoon";
+  return "Good evening";
+}
+
+function formatPairKey(pair) {
+  return pair.replace("/","");
+}
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
+const css = `
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+:root{
+  --bg:#08090B;--bg2:#0D0E11;--card:#111215;--card2:#16181D;--card3:#1B1E25;
+  --border:rgba(255,255,255,0.06);--border2:rgba(255,255,255,0.10);--border3:rgba(255,255,255,0.16);
+  --teal:#00CFFF;--teal2:#00AADE;--blue:#1B63FF;
+  --red:#FF3B3B;--red-bg:rgba(255,59,59,0.15);
+  --green:#2DDB81;--green-bg:rgba(45,219,129,0.12);
+  --amber:#FFB020;--amber-bg:rgba(255,176,32,0.12);
+  --text:#F2F4F8;--text2:#8B919C;--text3:#555B66;
+  --font:'Plus Jakarta Sans',sans-serif;
+}
+html,body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;}
+::-webkit-scrollbar{width:3px;height:3px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:99px;}
+
+.app{display:flex;flex-direction:column;min-height:100vh;max-width:480px;margin:0 auto;background:var(--bg);}
+
+/* Nav */
+.nav{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:16px 20px 12px;position:sticky;top:0;z-index:60;
+  background:linear-gradient(to bottom,var(--bg) 80%,transparent);
+}
+.nav-left{display:flex;align-items:center;gap:14px;}
+.nav-logo{display:flex;align-items:center;gap:8px;}
+.nav-brand{font-size:17px;font-weight:800;color:var(--text);letter-spacing:1.5px;text-transform:uppercase;}
+.nav-right{display:flex;align-items:center;gap:10px;}
+.nav-icon-btn{width:34px;height:34px;border-radius:50%;border:1px solid var(--border2);background:var(--card);display:flex;align-items:center;justify-content:center;cursor:pointer;color:var(--text2);font-size:14px;}
+.nav-avatar{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--teal),var(--blue));display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;cursor:pointer;overflow:hidden;border:2px solid transparent;transition:border-color 0.2s;}
+.nav-avatar:hover{border-color:var(--teal);}
+.nav-avatar img{width:100%;height:100%;object-fit:cover;}
+/* Profile Modal */
+.profile-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:200;display:flex;align-items:flex-end;justify-content:center;animation:fadeIn 0.2s ease;}
+.profile-sheet{width:100%;max-width:480px;background:var(--bg2);border-radius:20px 20px 0 0;border:1px solid var(--border2);border-bottom:none;padding:0 0 40px;animation:slideUp 0.25s ease;}
+.profile-handle{width:36px;height:4px;background:var(--border2);border-radius:99px;margin:12px auto 0;}
+.profile-header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px 8px;}
+.profile-title{font-size:17px;font-weight:800;letter-spacing:-0.4px;}
+.profile-close{background:var(--card);border:1px solid var(--border2);color:var(--text2);width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:14px;}
+.profile-avatar-wrap{display:flex;flex-direction:column;align-items:center;gap:10px;padding:20px 20px 24px;}
+.profile-avatar-big{width:82px;height:82px;border-radius:50%;background:linear-gradient(135deg,var(--teal),var(--blue));display:flex;align-items:center;justify-content:center;font-size:30px;font-weight:800;color:#fff;overflow:hidden;border:3px solid var(--border2);position:relative;cursor:pointer;}
+.profile-avatar-big img{width:100%;height:100%;object-fit:cover;}
+.profile-avatar-overlay{position:absolute;inset:0;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;font-size:20px;opacity:0;transition:opacity 0.2s;border-radius:50%;}
+.profile-avatar-big:hover .profile-avatar-overlay{opacity:1;}
+.profile-avatar-hint{font-size:11px;color:var(--text3);}
+.profile-body{padding:0 20px;}
+.profile-save-btn{width:100%;padding:13px;border-radius:12px;background:linear-gradient(90deg,var(--teal),var(--blue));color:#fff;font-family:var(--font);font-size:13px;font-weight:700;border:none;cursor:pointer;margin-top:20px;transition:opacity 0.15s;}
+.profile-save-btn:hover{opacity:0.9;}
+
+/* Scroll */
+.scroll-content{flex:1;overflow-y:auto;padding:4px 0 100px;}
+
+/* Greeting */
+.greeting-section{padding:8px 20px 20px;}
+.greeting-text{
+  font-size:26px;font-weight:800;letter-spacing:-0.8px;line-height:1.15;
+  background:linear-gradient(90deg,var(--teal) 0%,var(--blue) 100%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  margin-bottom:5px;
+}
+.greeting-sub{font-size:12px;color:var(--text3);font-weight:400;display:flex;align-items:center;gap:5px;}
+
+/* Sessions */
+.sessions-card{
+  margin:0 20px 20px;background:var(--card);border:1px solid var(--border);
+  border-radius:16px;padding:16px;display:grid;grid-template-columns:1fr 1fr;gap:14px;
+}
+.session-item{display:flex;flex-direction:column;gap:3px;}
+.session-top{display:flex;align-items:center;gap:6px;}
+.session-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+.session-dot.open{background:var(--teal);box-shadow:0 0 6px var(--teal);animation:pdot 2s infinite;}
+.session-dot.premarket{background:var(--blue);}
+.session-dot.closed{background:var(--text3);}
+@keyframes pdot{0%,100%{opacity:1;}50%{opacity:0.4;}}
+.session-name{font-size:11px;font-weight:700;letter-spacing:0.8px;color:var(--text);}
+.session-status-label{font-size:10px;font-weight:600;letter-spacing:0.5px;}
+.session-status-label.open{color:var(--teal);}
+.session-status-label.premarket{color:var(--blue);}
+.session-status-label.afterhours{color:var(--text3);}
+.session-time{font-size:10px;color:var(--text3);}
+
+/* Section header */
+.section-hdr{display:flex;align-items:center;justify-content:space-between;padding:0 20px;margin-bottom:12px;}
+.section-hdr-left{display:flex;align-items:center;gap:10px;}
+.section-icon{width:28px;height:28px;border-radius:8px;background:var(--card2);display:flex;align-items:center;justify-content:center;font-size:13px;}
+.section-title{font-size:15px;font-weight:700;color:var(--text);}
+.section-sub-label{font-size:11px;color:var(--text3);margin-top:1px;}
+.view-all-btn{font-size:12px;font-weight:600;color:var(--blue);background:none;border:none;cursor:pointer;display:flex;align-items:center;gap:4px;padding:6px 10px;border-radius:8px;transition:background 0.15s;}
+.view-all-btn:hover{background:rgba(0,207,255,0.1);}
+
+/* H-scroll */
+.h-scroll{display:flex;gap:12px;padding:0 20px;overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none;}
+.h-scroll::-webkit-scrollbar{display:none;}
+
+/* Macro card */
+.macro-card{
+  flex-shrink:0;width:230px;background:var(--card);border:1px solid var(--border);
+  border-radius:16px;padding:16px;cursor:pointer;transition:border-color 0.2s,transform 0.15s;
+}
+.macro-card:hover{border-color:var(--border2);transform:translateY(-1px);}
+.mc-top{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:10px;}
+.mc-pair{font-size:16px;font-weight:800;letter-spacing:-0.3px;}
+.mc-change{font-size:11px;font-weight:600;display:flex;align-items:center;gap:3px;}
+.mc-change.pos{color:var(--green);}.mc-change.neg{color:var(--red);}
+.bias-badge{font-size:10px;font-weight:700;letter-spacing:0.5px;padding:3px 9px;border-radius:20px;text-transform:uppercase;}
+.bias-badge.bearish{background:var(--red-bg);color:var(--red);}
+.bias-badge.bullish{background:var(--green-bg);color:var(--green);}
+.bias-badge.neutral{background:var(--amber-bg);color:var(--amber);}
+.confidence-label{font-size:10px;color:var(--text3);font-weight:500;margin-bottom:5px;}
+.conf-bar-track{height:3px;background:var(--border2);border-radius:99px;margin-bottom:4px;}
+.conf-bar-fill{height:100%;border-radius:99px;background:linear-gradient(90deg,var(--teal),var(--blue));transition:width 0.8s ease;}
+.conf-pct{font-size:11px;font-weight:700;color:var(--teal);text-align:right;margin-bottom:10px;}
+.ai-analysis-box{background:var(--card2);border-radius:10px;padding:10px 12px;border:1px solid var(--border);}
+.ai-analysis-label{font-size:10px;font-weight:700;color:var(--teal);display:flex;align-items:center;gap:5px;margin-bottom:5px;}
+.ai-analysis-text{font-size:11px;color:var(--text2);line-height:1.6;}
+
+/* Shimmer */
+.shimmer{background:linear-gradient(90deg,var(--card2) 25%,var(--card3) 50%,var(--card2) 75%);background-size:200% 100%;animation:shim 1.4s infinite;border-radius:6px;}
+@keyframes shim{0%{background-position:200% 0;}100%{background-position:-200% 0;}}
+
+/* Run btn */
+.run-btn{
+  width:calc(100% - 40px);margin:12px 20px 0;padding:13px;border-radius:12px;
+  background:linear-gradient(90deg,var(--teal),var(--blue));
+  color:#fff;font-family:var(--font);font-size:13px;font-weight:700;
+  border:none;cursor:pointer;letter-spacing:0.2px;
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  transition:opacity 0.15s,transform 0.15s;
+}
+.run-btn:hover:not(:disabled){opacity:0.9;transform:translateY(-1px);}
+.run-btn:disabled{opacity:0.6;cursor:not-allowed;transform:none;}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:spin 0.7s linear infinite;}
+.spin-teal{display:inline-block;width:14px;height:14px;border:2px solid rgba(0,207,255,0.2);border-top-color:var(--teal);border-radius:50%;animation:spin 0.7s linear infinite;margin-right:8px;vertical-align:middle;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+/* Ticker */
+.ticker-wrap{overflow:hidden;padding:14px 0;margin:20px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border);}
+.ticker-track{display:flex;gap:28px;animation:ticker 35s linear infinite;white-space:nowrap;}
+.ticker-track:hover{animation-play-state:paused;}
+@keyframes ticker{0%{transform:translateX(0);}100%{transform:translateX(-50%);}}
+.ticker-item{display:flex;align-items:center;gap:8px;flex-shrink:0;}
+.ticker-pair{font-size:11px;font-weight:700;color:var(--text2);letter-spacing:0.5px;}
+.ticker-price{font-size:12px;font-weight:600;color:var(--text);}
+.ticker-chg{font-size:10px;font-weight:600;}
+.ticker-chg.up{color:var(--green);}.ticker-chg.dn{color:var(--red);}
+.ticker-sep{width:1px;height:12px;background:var(--border2);}
+
+/* Market Brief cards */
+.brief-asset-cards{display:flex;flex-direction:column;gap:12px;padding:0 20px;}
+.brief-card-new{
+  background:var(--card);border:1px solid var(--border);border-radius:16px;
+  overflow:hidden;transition:border-color 0.2s;
+}
+.brief-card-new:hover{border-color:var(--border2);}
+.brief-card-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 16px 12px;border-bottom:1px solid var(--border);
+}
+.brief-pair-name{font-size:16px;font-weight:800;letter-spacing:-0.3px;}
+.brief-pair-meta{font-size:11px;color:var(--text3);margin-top:2px;}
+.brief-bias-right{display:flex;flex-direction:column;align-items:flex-end;gap:4px;}
+.brief-card-body{padding:14px 16px;}
+.brief-section-label{font-size:9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--teal);margin-bottom:6px;}
+.brief-text{font-size:12px;color:var(--text2);line-height:1.7;margin-bottom:12px;}
+.brief-watch-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:4px;}
+.brief-watch-item{background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:8px 10px;}
+.brief-watch-label{font-size:9px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;color:var(--text3);margin-bottom:3px;}
+.brief-watch-val{font-size:12px;font-weight:700;color:var(--text);}
+.news-item{display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);}
+.news-item:last-child{border-bottom:none;}
+.news-dot{width:5px;height:5px;border-radius:50%;background:var(--teal);flex-shrink:0;margin-top:5px;}
+.news-text{font-size:11px;color:var(--text2);line-height:1.5;}
+
+/* Calendar */
+.cal-section{padding:0 20px;}
+.cal-day-group{margin-bottom:20px;}
+.cal-day-label{font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--teal);display:flex;align-items:center;gap:10px;margin-bottom:10px;}
+.cal-day-label::after{content:'';flex:1;height:1px;background:var(--border);}
+.cal-event-row{
+  display:grid;grid-template-columns:52px 40px 1fr auto;gap:10px;align-items:center;
+  padding:11px 14px;background:var(--card);border:1px solid var(--border);
+  border-radius:12px;margin-bottom:7px;transition:border-color 0.15s;
+}
+.cal-event-row:hover{border-color:var(--border2);}
+.cal-event-row.upcoming{border-color:rgba(0,207,255,0.35);background:rgba(0,207,255,0.05);}
+.cal-event-row.past{opacity:0.45;}
+.cal-time-col{font-size:11px;color:var(--text3);font-weight:500;}
+.cal-currency-badge{font-size:9px;font-weight:800;letter-spacing:0.5px;padding:3px 6px;border-radius:6px;background:var(--card2);color:var(--text2);border:1px solid var(--border2);text-align:center;}
+.cal-event-name{font-size:12px;font-weight:600;color:var(--text);}
+.cal-prev-fcst{font-size:10px;color:var(--text3);margin-top:2px;}
+.impact-pill{font-size:9px;font-weight:700;letter-spacing:0.5px;padding:3px 8px;border-radius:99px;text-transform:uppercase;white-space:nowrap;}
+.impact-pill.high{background:var(--red-bg);color:var(--red);}
+.impact-pill.medium{background:var(--amber-bg);color:var(--amber);}
+.impact-pill.low{background:var(--card2);color:var(--text3);}
+.next-up-label{display:inline-flex;align-items:center;gap:5px;font-size:9px;font-weight:700;color:var(--teal);background:rgba(0,207,255,0.12);padding:2px 8px;border-radius:99px;margin-bottom:4px;}
+
+/* Journal */
+.journal-section{padding:0 20px;}
+.journal-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px;}
+.j-stat{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 10px;text-align:center;}
+.j-stat-val{font-size:20px;font-weight:800;letter-spacing:-0.5px;line-height:1;margin-bottom:4px;}
+.j-stat-lbl{font-size:9px;font-weight:600;letter-spacing:0.8px;text-transform:uppercase;color:var(--text3);}
+.j-stat-val.teal{color:var(--teal);}.j-stat-val.red{color:var(--red);}.j-stat-val.green{color:var(--green);}.j-stat-val.amber{color:var(--amber);}.j-stat-val.blue{color:var(--blue);}
+.log-form{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px;margin-bottom:16px;}
+.log-form-title{font-size:13px;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:8px;}
+.f-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;}
+.f-group{display:flex;flex-direction:column;gap:5px;}
+.f-label{font-size:10px;font-weight:600;letter-spacing:0.8px;text-transform:uppercase;color:var(--text3);}
+.f-input,.f-select,.f-textarea{background:var(--card2);border:1px solid var(--border2);border-radius:10px;color:var(--text);font-family:var(--font);font-size:13px;padding:9px 12px;outline:none;transition:border-color 0.15s;width:100%;}
+.f-input:focus,.f-select:focus,.f-textarea:focus{border-color:var(--teal);}
+.f-select option{background:var(--card2);}
+.f-textarea{resize:vertical;min-height:60px;line-height:1.5;}
+.log-btn{width:100%;padding:12px;border-radius:12px;background:linear-gradient(90deg,var(--teal),var(--blue));color:#fff;font-family:var(--font);font-size:13px;font-weight:700;border:none;cursor:pointer;margin-top:6px;transition:opacity 0.15s;display:flex;align-items:center;justify-content:center;gap:8px;}
+.log-btn:disabled{opacity:0.6;cursor:not-allowed;}
+.trade-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 16px;margin-bottom:8px;transition:border-color 0.15s;}
+.trade-card:hover{border-color:var(--border2);}
+.tc-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;}
+.tc-pair{font-size:15px;font-weight:800;letter-spacing:-0.3px;}
+.tc-pnl{font-size:15px;font-weight:800;}
+.tc-pnl.pos{color:var(--green);}.tc-pnl.neg{color:var(--red);}
+.tc-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.tc-tag{font-size:10px;font-weight:600;padding:3px 8px;border-radius:99px;background:var(--card2);color:var(--text2);border:1px solid var(--border);}
+.tc-tag.long{color:var(--green);border-color:rgba(45,219,129,0.2);background:rgba(45,219,129,0.06);}
+.tc-tag.short{color:var(--red);border-color:rgba(255,82,82,0.2);background:rgba(255,82,82,0.06);}
+.tc-tag.win{color:var(--teal);border-color:rgba(0,207,255,0.25);background:rgba(0,207,255,0.08);}
+.tc-tag.loss{color:var(--red);border-color:rgba(255,82,82,0.2);background:rgba(255,82,82,0.06);}
+.tc-del{background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:2px 4px;border-radius:4px;transition:color 0.15s;}
+.tc-del:hover{color:var(--red);}
+.pair-wr-title{font-size:10px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;color:var(--text3);margin-bottom:10px;}
+.pair-wr-row{display:flex;align-items:center;gap:10px;margin-bottom:8px;}
+.pair-wr-name{font-size:11px;font-weight:700;min-width:64px;color:var(--text);}
+.pair-wr-bar-track{flex:1;height:4px;background:var(--card2);border-radius:99px;}
+.pair-wr-bar-fill{height:100%;background:linear-gradient(90deg,var(--teal),var(--blue));border-radius:99px;}
+.pair-wr-pct{font-size:11px;font-weight:700;color:var(--teal);min-width:34px;text-align:right;}
+
+/* ── Asset Picker Modal ── */
+.modal-overlay{
+  position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:200;
+  display:flex;align-items:flex-end;justify-content:center;
+  animation:fadeIn 0.2s ease;
+}
+@keyframes fadeIn{from{opacity:0;}to{opacity:1;}}
+.modal-sheet{
+  width:100%;max-width:480px;background:var(--bg2);
+  border-radius:20px 20px 0 0;padding:0 0 32px;
+  border:1px solid var(--border2);border-bottom:none;
+  animation:slideUp 0.25s ease;max-height:90vh;overflow-y:auto;
+}
+@keyframes slideUp{from{transform:translateY(100%);}to{transform:translateY(0);}}
+.modal-handle{width:36px;height:4px;background:var(--border2);border-radius:99px;margin:12px auto 0;}
+.modal-header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px 12px;}
+.modal-title{font-size:17px;font-weight:800;letter-spacing:-0.4px;}
+.modal-close{background:var(--card);border:1px solid var(--border2);color:var(--text2);width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:14px;}
+.modal-sub{font-size:12px;color:var(--text3);padding:0 20px;margin-bottom:16px;}
+.asset-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:0 20px;}
+.asset-toggle{
+  padding:12px 8px;border-radius:12px;background:var(--card);border:1px solid var(--border);
+  text-align:center;cursor:pointer;transition:all 0.15s;
+  font-family:var(--font);
+}
+.asset-toggle:hover{border-color:var(--border2);}
+.asset-toggle.selected{background:rgba(0,207,255,0.1);border-color:var(--teal);}
+.asset-toggle-name{font-size:12px;font-weight:700;color:var(--text);margin-bottom:2px;}
+.asset-toggle-check{font-size:14px;}
+.modal-save-btn{
+  width:calc(100% - 40px);margin:16px 20px 0;padding:13px;border-radius:12px;
+  background:linear-gradient(90deg,var(--teal),var(--blue));
+  color:#fff;font-family:var(--font);font-size:13px;font-weight:700;
+  border:none;cursor:pointer;
+}
+
+/* Bottom Nav */
+.bottom-nav{
+  position:fixed;bottom:0;left:50%;transform:translateX(-50%);
+  width:100%;max-width:480px;
+  background:var(--bg2);border-top:1px solid var(--border);
+  display:flex;justify-content:space-around;align-items:center;
+  padding:10px 0 16px;z-index:50;
+}
+.bn-item{display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer;min-width:60px;padding:4px 8px;background:none;border:none;transition:all 0.15s;}
+.bn-icon{font-size:20px;transition:transform 0.15s;}
+.bn-label{font-size:9px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;color:var(--text3);transition:color 0.15s;}
+.bn-item.active .bn-label{color:var(--teal);}
+.bn-item.active .bn-icon{transform:translateY(-2px);}
+
+.empty-state{text-align:center;padding:40px 16px;color:var(--text3);font-size:13px;}
+.divider{height:1px;background:var(--border);margin:16px 0;}
+`;
+
+// ─── Ticker ───────────────────────────────────────────────────────────────────
+const TICKER_PAIRS = ["EUR/USD","GBP/USD","XAU/USD","USD/JPY","NAS100","US30","BTC/USD","OIL/USD"];
+
+// Static fallback prices shown until live data arrives
+const TICKER_STATIC = {
+  "EUR/USD":{price:"—",chg:"—",up:true},
+  "GBP/USD":{price:"—",chg:"—",up:true},
+  "XAU/USD":{price:"—",chg:"—",up:true},
+  "USD/JPY":{price:"—",chg:"—",up:true},
+  "NAS100": {price:"—",chg:"—",up:true},
+  "US30":   {price:"—",chg:"—",up:true},
+  "BTC/USD":{price:"—",chg:"—",up:true},
+  "OIL/USD":{price:"—",chg:"—",up:true},
+};
+
+function Ticker({ livePrices }) {
+  const items = TICKER_PAIRS.map(pair => {
+    const live = livePrices?.[pair];
+    const stat = TICKER_STATIC[pair];
+    return { pair, price: live?.price ?? stat.price, chg: live?.change ?? stat.chg, up: live != null ? live.up : stat.up };
+  });
+  const doubled = [...items,...items];
+  return (
+    <div className="ticker-wrap">
+      <div className="ticker-track">
+        {doubled.map((item,i) => (
+          <div className="ticker-item" key={i}>
+            <span className="ticker-pair">{item.pair}</span>
+            <span className="ticker-price">{item.price}</span>
+            <span className={`ticker-chg ${item.up?"up":"dn"}`}>{item.chg}</span>
+            {i<doubled.length-1&&<div className="ticker-sep"/>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Sessions ─────────────────────────────────────────────────────────────────
+function Sessions() {
+  const getStatus = s => {
+    const h = getHour(s.tz);
+    if (h>=s.open&&h<s.close) return "open";
+    if (h>=s.open-1&&h<s.open) return "premarket";
+    return "afterhours";
+  };
+  const getLabel = st => ({open:"OPEN",premarket:"PRE MARKET",afterhours:"AFTER HOURS"}[st]);
+  const getNote  = (s,st) => {
+    const h = getHour(s.tz);
+    if (st==="open") return `closes in ${s.close-h}h`;
+    if (st==="premarket") return "opens in ~1h";
+    return `opens in ~${(s.open+24-h)%24}h`;
+  };
+  return (
+    <div className="sessions-card">
+      {SESSIONS_DEF.map(s => {
+        const st = getStatus(s);
+        return (
+          <div className="session-item" key={s.name}>
+            <div className="session-top">
+              <div className={`session-dot ${st==="open"?"open":st==="premarket"?"premarket":"closed"}`}/>
+              <span className="session-name">{s.name}</span>
+            </div>
+            <span className={`session-status-label ${st}`}>{getLabel(st)}</span>
+            <span className="session-time">{getNote(s,st)}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Asset Picker Modal ───────────────────────────────────────────────────────
+function AssetPickerModal({ title, subtitle, current, onSave, onClose }) {
+  const [selected, setSelected] = useState(new Set(current));
+  const toggle = a => {
+    setSelected(prev => {
+      const n = new Set(prev);
+      if (n.has(a)) { if (n.size>1) n.delete(a); }
+      else n.add(a);
+      return n;
+    });
+  };
+  return (
+    <div className="modal-overlay" onClick={e => e.target===e.currentTarget&&onClose()}>
+      <div className="modal-sheet">
+        <div className="modal-handle"/>
+        <div className="modal-header">
+          <div className="modal-title">{title}</div>
+          <button className="modal-close" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-sub">{subtitle}</div>
+        <div className="asset-grid">
+          {ALL_AVAILABLE_ASSETS.map(a => {
+            const sel = selected.has(a);
+            return (
+              <div key={a} className={`asset-toggle ${sel?"selected":""}`} onClick={()=>toggle(a)}>
+                <div className="asset-toggle-name">{a}</div>
+                <div className="asset-toggle-check">{sel?"✦":"○"}</div>
+              </div>
+            );
+          })}
+        </div>
+        <button className="modal-save-btn" onClick={()=>onSave([...selected])}>
+          Save {selected.size} Asset{selected.size!==1?"s":""}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Macro Card ───────────────────────────────────────────────────────────────
+function MacroCard({ pair, data, loading }) {
+  return (
+    <div className="macro-card">
+      <div className="mc-top">
+        <div>
+          <div className="mc-pair">{pair}</div>
+          {data&&<div className={`mc-change ${data.up?"pos":"neg"}`}>{data.up?"▲":"▼"} {data.change}</div>}
+          {loading&&!data&&<div className="shimmer" style={{width:50,height:14,marginTop:4}}/>}
+        </div>
+        {data&&<span className={`bias-badge ${data.bias}`}>{data.bias}</span>}
+        {loading&&!data&&<div className="shimmer" style={{width:60,height:22,borderRadius:99}}/>}
+      </div>
+      {(loading||data)&&(
+        <>
+          <div className="confidence-label">Confidence</div>
+          {loading&&!data
+            ?<div className="shimmer" style={{height:3,marginBottom:16}}/>
+            :<><div className="conf-bar-track"><div className="conf-bar-fill" style={{width:`${data.confidence}%`}}/></div><div className="conf-pct">{data.confidence}%</div></>}
+          <div className="ai-analysis-box">
+            <div className="ai-analysis-label">✦ AI Analysis</div>
+            {loading&&!data
+              ?<><div className="shimmer" style={{height:10,marginBottom:5}}/><div className="shimmer" style={{height:10,width:"80%",marginBottom:5}}/><div className="shimmer" style={{height:10,width:"60%"}}/></>
+              :<div className="ai-analysis-text">{data.analysis}</div>}
+          </div>
+        </>
+      )}
+      {!data&&!loading&&<div style={{fontSize:11,color:"var(--text3)",marginTop:8}}>Loading…</div>}
+    </div>
+  );
+}
+
+// ─── Storage helpers (window.storage in artifact env, localStorage everywhere else)
+async function storageGet(key) {
+  try { const r = await window.storage.get(key); if (r?.value) return JSON.parse(r.value); } catch {}
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch { return null; }
+}
+async function storageSet(key, val) {
+  const s = JSON.stringify(val);
+  try { await window.storage.set(key, s); } catch {}
+  try { localStorage.setItem(key, s); } catch {}
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+const TABS = [
+  {id:"home",  icon:"⬡", label:"Home"},
+  {id:"brief", icon:"◎", label:"Brief"},
+  {id:"cal",   icon:"▦", label:"Calendar"},
+  {id:"journal",icon:"◈",label:"Journal"},
+];
+
+// ─── Profile Modal ────────────────────────────────────────────────────────────
+function ProfileModal({ name, avatar, onSave, onClose }) {
+  const [draftName,   setDraftName]   = useState(name);
+  const [draftAvatar, setDraftAvatar] = useState(avatar); // base64 or null
+  const fileRef = useRef();
+
+  const handleImage = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => setDraftAvatar(ev.target.result);
+    reader.readAsDataURL(file);
+  };
+
+  const initials = draftName ? draftName.trim().split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2) : "?";
+
+  return (
+    <div className="profile-overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="profile-sheet">
+        <div className="profile-handle"/>
+        <div className="profile-header">
+          <div className="profile-title">Your Profile</div>
+          <button className="profile-close" onClick={onClose}>✕</button>
+        </div>
+
+        <div className="profile-avatar-wrap">
+          <div className="profile-avatar-big" onClick={()=>fileRef.current.click()}>
+            {draftAvatar
+              ? <img src={draftAvatar} alt="avatar"/>
+              : <span>{initials}</span>}
+            <div className="profile-avatar-overlay">📷</div>
+          </div>
+          <div className="profile-avatar-hint">Tap to change photo</div>
+          <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={handleImage}/>
+        </div>
+
+        <div className="profile-body">
+          <div className="f-group">
+            <label className="f-label">Display Name</label>
+            <input
+              className="f-input"
+              value={draftName}
+              onChange={e=>setDraftName(e.target.value)}
+              placeholder="Your name"
+            />
+          </div>
+          <button className="profile-save-btn" onClick={()=>onSave(draftName, draftAvatar)}>
+            Save Changes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [tab, setTab] = useState("home");
+  const [showProfile, setShowProfile] = useState(false);
+
+  // User profile
+  const [userName,   setUserName]   = useState(USER_NAME);
+  const [userAvatar, setUserAvatar] = useState(null);
+
+  // Shared state — loaded once, passed down
+  const [macroAssets,  setMacroAssets]  = useState(DEFAULT_MACRO_ASSETS);
+  const [briefAssets,  setBriefAssets]  = useState(DEFAULT_BRIEF_ASSETS);
+  const [macroData,    setMacroData]    = useState({});
+  const [macroLoading, setMacroLoading] = useState(false);
+  const [livePrices,   setLivePrices]   = useState({});
+  const macroFetched = useRef(false);
+
+  // Load saved prefs
+  useEffect(() => {
+    (async () => {
+      const ma = await storageGet("atlas_macro_assets");
+      if (ma) setMacroAssets(ma);
+      const ba = await storageGet("atlas_brief_assets");
+      if (ba) setBriefAssets(ba);
+      const profile = await storageGet("atlas_profile");
+      if (profile?.name)   setUserName(profile.name);
+      if (profile?.avatar) setUserAvatar(profile.avatar);
+    })();
+  }, []);
+
+  // Auto-fetch macro on mount (once)
+  useEffect(() => {
+    if (!macroFetched.current) {
+      macroFetched.current = true;
+      fetchMacro(macroAssets);
+    }
+  }, []);
+
+  // Fetch live prices on mount and refresh every 60s
+  useEffect(() => {
+    const load = () => fetchLivePrices(TICKER_PAIRS).then(p => { if (Object.keys(p).length) setLivePrices(p); });
+    load();
+    const iv = setInterval(load, 60000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const fetchMacro = async (assets) => {
+    setMacroLoading(true);
+    setMacroData({});
+    try {
+      const keys = assets.map(formatPairKey);
+      // Fetch live prices to ground the AI analysis
+      const prices = await fetchLivePrices(assets);
+      const priceLines = assets.map(a => {
+        const p = prices[a];
+        return p ? `${a}: ${p.price} (${p.change})` : null;
+      }).filter(Boolean);
+      const priceCtx = priceLines.length > 0
+        ? `\nCurrent live prices: ${priceLines.join(", ")}.`
+        : "";
+      const result = await callClaude(
+        `You are an institutional-grade Smart Money Concepts (SMC) analyst. Your analysis is based exclusively on ICT/SMC methodology — NOT retail indicators or chart patterns. Use your deep knowledge of current market structure, DXY flows, liquidity levels, and institutional order flow.
+
+Return ONLY valid JSON (no markdown, no preamble) with this exact structure:
+{
+  "XAUUSD": { "bias": "bearish", "confidence": 78, "change": "-0.8%", "up": false, "analysis": "3-4 sentence SMC analysis covering: institutional bias (BSL or SSL being targeted), key premium/discount levels, recent CHoCH or BOS, and the HTF POI price is heading toward. Include specific approximate price levels." }
+}
+bias must be exactly 'bullish', 'bearish', or 'neutral'. confidence 40-95. Return ONLY the JSON object.`,
+        `Today is ${new Date().toDateString()}.${priceCtx} Provide SMC analysis for these assets: ${keys.join(", ")}. Base your analysis on current market structure, key liquidity levels, DXY correlation, and HTF bias. Use asset names without slash as JSON keys.`
+      );
+      const clean = result.replace(/```json|```/g,"").trim();
+      const s=clean.indexOf("{"), e=clean.lastIndexOf("}");
+      if (s!==-1 && e!==-1) {
+        const parsed = JSON.parse(clean.slice(s,e+1));
+        const normalised = {};
+        assets.forEach(asset => {
+          normalised[asset] = parsed[formatPairKey(asset)] || parsed[asset] || null;
+        });
+        setMacroData(normalised);
+      } else {
+        // Partial fallback — mark all as error
+        const err = {};
+        assets.forEach(a => { err[a] = { bias:"neutral", confidence:0, change:"—", up:false, analysis:"Could not parse response. Tap Refresh to retry." }; });
+        setMacroData(err);
+      }
+    } catch(e) {
+      const err = {};
+      assets.forEach(a => { err[a] = { bias:"neutral", confidence:0, change:"—", up:false, analysis:`Error: ${e.message}` }; });
+      setMacroData(err);
+    }
+    setMacroLoading(false);
+  };
+
+  const saveMacroAssets = async (assets) => {
+    setMacroAssets(assets);
+    await storageSet("atlas_macro_assets", assets);
+    fetchMacro(assets);
+  };
+
+  const saveBriefAssets = async (assets) => {
+    setBriefAssets(assets);
+    await storageSet("atlas_brief_assets", assets);
+  };
+
+  const saveProfile = async (name, avatar) => {
+    setUserName(name || USER_NAME);
+    setUserAvatar(avatar);
+    await storageSet("atlas_profile", { name: name || USER_NAME, avatar });
+    setShowProfile(false);
+  };
+
+  // Avatar initials for nav
+  const navInitials = userName.trim().split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2);
+
+  return (
+    <>
+      <style>{css}</style>
+      <div className="app">
+        <nav className="nav">
+          <div className="nav-left">
+            <div className="nav-logo">
+              <span className="nav-brand">GEMINI<span style={{color:"var(--teal)",marginLeft:2}}>.</span></span>
+            </div>
+          </div>
+          <div className="nav-right">
+            <div className="nav-avatar" onClick={()=>setShowProfile(true)}>
+              {userAvatar ? <img src={userAvatar} alt="avatar"/> : navInitials}
+            </div>
+          </div>
+        </nav>
+
+        <div className="scroll-content">
+          {tab==="home"    && <HomeTab macroAssets={macroAssets} macroData={macroData} macroLoading={macroLoading} onRefresh={()=>fetchMacro(macroAssets)} onEditAssets={saveMacroAssets} setTab={setTab} userName={userName} livePrices={livePrices}/>}
+          {tab==="brief"   && <BriefTab briefAssets={briefAssets} onEditAssets={saveBriefAssets}/>}
+          {tab==="cal"     && <CalendarTab/>}
+          {tab==="journal" && <JournalTab/>}
+        </div>
+
+        <div className="bottom-nav">
+          {TABS.map(t=>(
+            <button key={t.id} className={`bn-item ${tab===t.id?"active":""}`} onClick={()=>setTab(t.id)}>
+              <span className="bn-icon">{t.icon}</span>
+              <span className="bn-label">{t.label}</span>
+            </button>
+          ))}
+        </div>
+
+        {showProfile && (
+          <ProfileModal
+            name={userName}
+            avatar={userAvatar}
+            onSave={saveProfile}
+            onClose={()=>setShowProfile(false)}
+          />
+        )}
+      </div>
+    </>
+  );
+}
+
+// ─── Home Tab ─────────────────────────────────────────────────────────────────
+function HomeTab({ macroAssets, macroData, macroLoading, onRefresh, onEditAssets, setTab, userName, livePrices }) {
+  const [showPicker, setShowPicker] = useState(false);
+
+  return (
+    <>
+      <div className="greeting-section">
+        <div className="greeting-text">{getGreeting()}, {userName || USER_NAME}.</div>
+        <div className="greeting-sub">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M6 1L7.5 4.5H11L8.25 6.75L9.5 10.5L6 8.25L2.5 10.5L3.75 6.75L1 4.5H4.5L6 1Z" fill="currentColor"/></svg>
+          Global economic chaos, turned into clarity
+        </div>
+      </div>
+
+      <Sessions/>
+
+      {/* Macro Desk */}
+      <div className="section-hdr">
+        <div className="section-hdr-left">
+          <div className="section-icon">📈</div>
+          <div>
+            <div className="section-title">AI Macro Desk</div>
+            <div className="section-sub-label">Market bias analysis · Live</div>
+          </div>
+        </div>
+        <button className="view-all-btn" onClick={()=>setShowPicker(true)}>Edit Assets →</button>
+      </div>
+
+      <div className="h-scroll" style={{paddingBottom:8}}>
+        {macroAssets.map(p=>(
+          <MacroCard key={p} pair={p} data={macroData[p]||null} loading={macroLoading}/>
+        ))}
+      </div>
+
+      <button className="run-btn" onClick={onRefresh} disabled={macroLoading}>
+        {macroLoading?<><span className="spin"/>Analysing markets…</>:"↺ Refresh Analysis"}
+      </button>
+
+      <Ticker livePrices={livePrices}/>
+
+      {/* Quick links */}
+      <div className="section-hdr">
+        <div className="section-hdr-left">
+          <div className="section-icon">⚡</div>
+          <div><div className="section-title">Quick Access</div></div>
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,padding:"0 20px 20px"}}>
+        {[
+          {icon:"◎",label:"Market Brief",   sub:"Live asset briefings", tab:"brief"},
+          {icon:"▦",label:"Econ Calendar",  sub:"Upcoming events",      tab:"cal"},
+          {icon:"◈",label:"Trade Journal",  sub:"Log & track trades",   tab:"journal"},
+          {icon:"◇",label:"Sessions",       sub:"Market hours open/close",tab:"home"},
+        ].map(item=>(
+          <div key={item.label} onClick={()=>setTab(item.tab)}
+            style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:14,padding:14,cursor:"pointer",transition:"border-color 0.15s"}}
+            onMouseEnter={e=>e.currentTarget.style.borderColor="var(--border2)"}
+            onMouseLeave={e=>e.currentTarget.style.borderColor="var(--border)"}
+          >
+            <div style={{fontSize:18,marginBottom:6}}>{item.icon}</div>
+            <div style={{fontSize:13,fontWeight:700}}>{item.label}</div>
+            <div style={{fontSize:11,color:"var(--text3)",marginTop:2}}>{item.sub}</div>
+          </div>
+        ))}
+      </div>
+
+      {showPicker&&(
+        <AssetPickerModal
+          title="Macro Desk Assets"
+          subtitle="Choose the assets you want to track on your macro desk. They'll auto-load every time you open GEMINI."
+          current={macroAssets}
+          onSave={assets=>{onEditAssets(assets);setShowPicker(false);}}
+          onClose={()=>setShowPicker(false)}
+        />
+      )}
+    </>
+  );
+}
+
+// ─── Brief Tab ────────────────────────────────────────────────────────────────
+function parseBrief(text) {
+  // Parse the structured AI response into sections
+  const sections = {};
+  const lines = text.split("\n");
+  let current = null;
+  lines.forEach(line => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const isHeader = /^[A-Z &\/]+:$/.test(trimmed) || /^(PRICE|TECHNICAL|FUNDAMENTAL|LATEST|WATCH|BIAS|OVERVIEW)/.test(trimmed);
+    if (isHeader) { current = trimmed.replace(/:$/,""); sections[current]=[]; }
+    else if (current) sections[current].push(trimmed);
+  });
+  // Fallback: return raw text
+  if (Object.keys(sections).length < 2) return null;
+  return sections;
+}
+
+function BriefCard({ asset, data, loading }) {
+  const bias = data ? (data.toLowerCase().includes("bullish")?"bullish":data.toLowerCase().includes("bearish")?"bearish":"neutral") : null;
+
+  return (
+    <div className="brief-card-new">
+      <div className="brief-card-header">
+        <div>
+          <div className="brief-pair-name">{asset}</div>
+          <div className="brief-pair-meta">Live brief · {new Date().toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})}</div>
+        </div>
+        <div className="brief-bias-right">
+          {bias&&<span className={`bias-badge ${bias}`}>{bias}</span>}
+          {loading&&!data&&<div className="shimmer" style={{width:64,height:22,borderRadius:99}}/>}
+        </div>
+      </div>
+      <div className="brief-card-body">
+        {loading&&!data&&(
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {[100,85,92,70,88,60].map((w,i)=><div key={i} className="shimmer" style={{height:11,width:`${w}%`}}/>)}
+          </div>
+        )}
+        {!loading&&!data&&<div style={{fontSize:12,color:"var(--text3)",fontStyle:"italic"}}>Loading brief…</div>}
+        {data&&<div className="brief-text">{data}</div>}
+      </div>
+    </div>
+  );
+}
+
+function BriefTab({ briefAssets, onEditAssets }) {
+  const [briefs,      setBriefs]      = useState({});
+  const [loading,     setLoading]     = useState(false);
+  const [loadingOne,  setLoadingOne]  = useState({});  // per-card loading
+  const [showPicker,  setShowPicker]  = useState(false);
+  const fetchedRef    = useRef(false);
+
+  useEffect(() => {
+    if (!fetchedRef.current) {
+      fetchedRef.current = true;
+      fetchAllBriefs(briefAssets);
+    }
+  }, []);
+
+  // Fetch briefs — one call per asset in parallel, plain text (no JSON parsing)
+  const fetchSingleBrief = async (asset) => {
+    // Fetch live price + news in parallel with the AI call
+    const [liveData, headlines] = await Promise.all([
+      fetchLivePrices([asset]),
+      fetchNewsHeadlines(asset),
+    ]);
+    const priceCtx = liveData[asset]
+      ? `Current price: ${liveData[asset].price} (${liveData[asset].change}). `
+      : "";
+    const newsCtx = headlines.length > 0
+      ? `\nRecent headlines: ${headlines.slice(0,3).join(" | ")}.`
+      : "";
+    const result = await callClaudeFast(
+      `You are an institutional Smart Money Concepts (SMC) analyst. Write a single paragraph of exactly 120-150 words as plain text — no headers, no bullets, no JSON, no markdown. Cover: (1) current HTF market structure and most recent BOS or CHoCH, (2) where BSL and SSL sit with approximate price levels, (3) the most relevant order block or FVG with a specific price level, (4) the primary fundamental driver right now, (5) your overall bias and whether price is in premium or discount. Be direct and specific.`,
+      `${priceCtx}SMC brief for ${asset} today ${new Date().toDateString()}.${newsCtx}`
+    );
+    if (!result || result.trim().length < 20) throw new Error("Empty response");
+    return result.trim();
+  };
+
+  const fetchAllBriefs = async (assets) => {
+    setLoading(true);
+    setBriefs({});
+    setLoadingOne({});
+    // Fire all calls in parallel
+    const results = await Promise.allSettled(assets.map(a => fetchSingleBrief(a)));
+    const updated = {};
+    assets.forEach((a, i) => {
+      updated[a] = results[i].status === "fulfilled"
+        ? results[i].value
+        : `Error: ${results[i].reason?.message || "unknown"}. Tap ↺ to retry.`;
+    });
+    setBriefs(updated);
+    setLoading(false);
+  };
+
+  const refreshAll = () => {
+    fetchedRef.current = false;
+    fetchAllBriefs(briefAssets);
+  };
+
+  const refreshOne = async (asset) => {
+    setLoadingOne(prev => ({...prev, [asset]: true}));
+    setBriefs(prev => ({...prev, [asset]: null}));
+    try {
+      const result = await fetchSingleBrief(asset);
+      setBriefs(prev => ({...prev, [asset]: result}));
+    } catch(_) {
+      setBriefs(prev => ({...prev, [asset]: `Error: ${e.message}. Tap ↺ to retry.`}));
+    }
+    setLoadingOne(prev => ({...prev, [asset]: false}));
+  };
+
+  return (
+    <>
+      <div className="greeting-section" style={{paddingBottom:12}}>
+        <div className="greeting-text" style={{fontSize:22}}>Market Brief</div>
+        <div className="greeting-sub">SMC analysis · {briefAssets.length} assets · single batch load</div>
+      </div>
+
+      <div className="section-hdr" style={{marginBottom:16}}>
+        <div className="section-hdr-left">
+          <div className="section-icon">◎</div>
+          <div><div className="section-title">Your Assets</div></div>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button className="view-all-btn" onClick={refreshAll} disabled={loading}
+            style={{color:"var(--text2)"}}>
+            {loading ? "Loading…" : "↺ Refresh All"}
+          </button>
+          <button className="view-all-btn" onClick={()=>setShowPicker(true)}>Edit List →</button>
+        </div>
+      </div>
+
+      {loading && (
+        <div style={{padding:"0 20px"}}>
+          <div style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:16,padding:20,display:"flex",flexDirection:"column",gap:10}}>
+            <div style={{fontSize:13,color:"var(--text2)",display:"flex",alignItems:"center",gap:10,marginBottom:4}}>
+              <span className="spin-teal"/>
+              Running single batch analysis for {briefAssets.length} assets…
+            </div>
+            {briefAssets.map(a=>(
+              <div key={a} style={{display:"flex",alignItems:"center",gap:10}}>
+                <div style={{fontSize:12,fontWeight:700,minWidth:72,color:"var(--text)"}}>{a}</div>
+                <div className="shimmer" style={{flex:1,height:10}}/>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!loading && (
+        <div className="brief-asset-cards">
+          {briefAssets.map(asset => {
+            const isRefreshing = loadingOne[asset] || false;
+            return (
+              <div key={asset}>
+                <BriefCard
+                  asset={asset}
+                  data={briefs[asset] || null}
+                  loading={isRefreshing}
+                />
+                <div style={{display:"flex",justifyContent:"flex-end",padding:"4px 4px 0"}}>
+                  <button
+                    onClick={()=>!isRefreshing && refreshOne(asset)}
+                    disabled={isRefreshing}
+                    style={{background:"none",border:"none",color:isRefreshing?"var(--teal)":"var(--text3)",fontSize:11,cursor:isRefreshing?"default":"pointer",fontFamily:"var(--font)",display:"flex",alignItems:"center",gap:4,padding:"4px 8px"}}>
+                    {isRefreshing ? <><span className="spin-teal"/>Loading…</> : "↺ Refresh"}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {showPicker&&(
+        <AssetPickerModal
+          title="Your Asset List"
+          subtitle="Choose the assets you want briefings for."
+          current={briefAssets}
+          onSave={assets=>{onEditAssets(assets);setShowPicker(false);fetchedRef.current=false;fetchAllBriefs(assets);}}
+          onClose={()=>setShowPicker(false)}
+        />
+      )}
+    </>
+  );
+}
+
+// ─── Calendar Tab ─────────────────────────────────────────────────────────────
+function CalendarTab() {
+  const [events,   setEvents]   = useState(null);
+  const [loading,  setLoading]  = useState(false);
+  const [calError, setCalError] = useState(null);
+  const nextRef    = useRef(null);
+  const hasFetched = useRef(false);
+
+  // Auto-load this week on mount
+  useEffect(() => {
+    if (!hasFetched.current) {
+      hasFetched.current = true;
+      load();
+    }
+  }, []);
+
+  // Scroll to next event after events load
+  useEffect(() => {
+    if (events && nextRef.current) {
+      setTimeout(()=>nextRef.current?.scrollIntoView({behavior:"smooth",block:"center"}),300);
+    }
+  }, [events]);
+
+  const load = async (week = "this") => {
+    setLoading(true); setEvents(null);
+    setCalError(null);
+    try {
+      // GET request — no Content-Type header (avoids CORS preflight on mobile)
+      const url = `${CLAUDE_API}/calendar${week === "next" ? "?week=next" : ""}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Worker returned HTTP ${res.status}`);
+      const raw = await res.json();
+      if (raw.error) throw new Error(raw.error);
+      if (!Array.isArray(raw)) throw new Error("Unexpected response format");
+
+      const IMPACT_MAP = { "High":"high","Medium":"medium","Low":"low","Holiday":"low" };
+      const KEEP = new Set(["USD","EUR","GBP","JPY","AUD","CAD","CHF","NZD"]);
+
+      const mapped = raw
+        .filter(e => KEEP.has(e.country) && (IMPACT_MAP[e.impact]==="high"||IMPACT_MAP[e.impact]==="medium"))
+        .map(e => {
+          const d = new Date(e.date);
+          const dateStr = d.toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"});
+          const timeStr = d.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit",timeZone:"UTC"});
+          return {
+            date: dateStr,
+            time: timeStr==="00:00"?"All Day":timeStr,
+            currency: e.country,
+            event: e.title,
+            impact: IMPACT_MAP[e.impact]||"low",
+            previous: e.previous||"—",
+            forecast: e.forecast||"—",
+            _ts: d.getTime(),
+          };
+        })
+        .sort((a,b)=>a._ts-b._ts);
+
+      setEvents(mapped.length ? mapped : []);
+    } catch(err) {
+      setCalError(err.message);
+      setEvents([]);
+    }
+    setLoading(false);
+  };
+
+  // Determine if an event is past, current/next, or future
+  const now = new Date();
+  const todayStr = now.toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"})
+    .replace(",","");
+
+  const getEventStatus = (ev) => {
+    try {
+      // Parse event datetime roughly
+      const [hh,mm] = (ev.time||"00:00").split(":").map(Number);
+      // We can't perfectly parse "Mon 3 Mar" without year, so use today comparison
+      const evDateMatch = ev.date?.match(/(\d+)\s+(\w+)/);
+      if (!evDateMatch) return "future";
+      const day = parseInt(evDateMatch[1]);
+      const curDay = now.getDate();
+      if (day < curDay) return "past";
+      if (day > curDay) return "future";
+      // Same day — compare time
+      const evMinutes = hh*60+mm;
+      const nowMinutes = now.getHours()*60+now.getMinutes();
+      if (evMinutes < nowMinutes) return "past";
+      if (evMinutes <= nowMinutes+60) return "next";
+      return "future";
+    } catch { return "future"; }
+  };
+
+  const grouped = events ? events.reduce((acc,e)=>{(acc[e.date]=[...(acc[e.date]||[]),e]);return acc;},{}) : {};
+  let foundNext = false;
+
+  return (
+    <>
+      <div className="greeting-section" style={{paddingBottom:12}}>
+        <div className="greeting-text" style={{fontSize:22}}>Economic Calendar</div>
+        <div className="greeting-sub">
+          {new Date().toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"long",year:"numeric"})} ·{" "}
+          {new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}
+        </div>
+      </div>
+
+      <div className="cal-section">
+        {/* Refresh row */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+          <div style={{fontSize:12,color:"var(--text3)"}}>
+            {events ? `${events.length} events this week` : loading ? "Loading events…" : ""}
+          </div>
+          <button onClick={load} disabled={loading}
+            style={{background:"var(--card)",border:"1px solid var(--border2)",borderRadius:8,color:"var(--text2)",fontSize:12,padding:"6px 12px",cursor:"pointer",fontFamily:"var(--font)",display:"flex",alignItems:"center",gap:6,fontWeight:600}}>
+            {loading?<><span className="spin-teal"/>Loading…</>:"↺ Refresh"}
+          </button>
+        </div>
+
+        {loading&&(
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {Array(10).fill(0).map((_,i)=><div key={i} className="shimmer" style={{height:58,borderRadius:12}}/>)}
+          </div>
+        )}
+
+        {calError&&<div className="empty-state" style={{color:"var(--red)",fontSize:12,lineHeight:1.6}}>
+          ⚠ {calError}<br/>
+          <span style={{color:"var(--text3)",fontSize:11}}>Make sure your Cloudflare Worker has been updated with the new code.</span>
+        </div>}
+        {!calError&&events&&events.length===0&&<div className="empty-state">No events found. Tap ↺ Refresh to try again.</div>}
+
+        {events&&events.length>0&&Object.entries(grouped).map(([date,dayEvs])=>(
+          <div className="cal-day-group" key={date}>
+            <div className="cal-day-label">{date}</div>
+            {dayEvs.map((ev,i)=>{
+              const status = getEventStatus(ev);
+              const isNext = status==="next"&&!foundNext;
+              if (isNext) foundNext = true;
+              return (
+                <div
+                  key={i}
+                  ref={isNext?nextRef:null}
+                  className={`cal-event-row ${isNext||status==="next"?"upcoming":status==="past"?"past":""}`}
+                >
+                  <div className="cal-time-col">
+                    {isNext&&<div className="next-up-label">▶ NEXT</div>}
+                    {ev.time||"—"}
+                  </div>
+                  <span className="cal-currency-badge">{ev.currency}</span>
+                  <div>
+                    <div className="cal-event-name">{ev.event}</div>
+                    <div className="cal-prev-fcst">Prev: {ev.previous||"—"} · Fcst: {ev.forecast||"—"}</div>
+                  </div>
+                  <span className={`impact-pill ${ev.impact}`}>{ev.impact}</span>
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+// ─── Journal Tab ──────────────────────────────────────────────────────────────
+const EMPTY_FORM = {date:new Date().toISOString().slice(0,10),pair:"EUR/USD",direction:"Long",session:"London",time:"",lots:"",pnl:"",rr:"",outcome:"Win",notes:""};
+
+function calcStats(trades) {
+  if(!trades.length) return null;
+  const wins=trades.filter(t=>t.outcome==="Win").length;
+  const wr=((wins/trades.length)*100).toFixed(0);
+  const totalPnl=trades.reduce((a,t)=>a+(parseFloat(t.pnl)||0),0).toFixed(2);
+  const rrs=trades.map(t=>parseFloat(t.rr)).filter(Boolean);
+  const avgRR=rrs.length?(rrs.reduce((a,b)=>a+b,0)/rrs.length).toFixed(1):"—";
+  const pairMap={};
+  trades.forEach(t=>{(pairMap[t.pair]=pairMap[t.pair]||{w:0,t:0});pairMap[t.pair].t++;if(t.outcome==="Win")pairMap[t.pair].w++;});
+  const bestPair=Object.entries(pairMap).sort((a,b)=>(b[1].w/b[1].t)-(a[1].w/a[1].t))[0]?.[0]||"—";
+  const dayMap={};
+  trades.forEach(t=>{const d=new Date(t.date).toLocaleDateString("en-GB",{weekday:"short"});(dayMap[d]=dayMap[d]||{pnl:0}).pnl+=(parseFloat(t.pnl)||0);});
+  const bestDay=Object.entries(dayMap).sort((a,b)=>b[1].pnl-a[1].pnl)[0]?.[0]||"—";
+  const worstDay=Object.entries(dayMap).sort((a,b)=>a[1].pnl-b[1].pnl)[0]?.[0]||"—";
+  const pl=Object.entries(pairMap).map(([pair,d])=>({pair,wr:((d.w/d.t)*100).toFixed(0),t:d.t})).sort((a,b)=>b.wr-a.wr).slice(0,4);
+  return{wins,total:trades.length,wr,totalPnl,avgRR,bestPair,bestDay,worstDay,pl};
+}
+
+function JournalTab() {
+  const [trades,setTrades]=useState([]);
+  const [form,setForm]=useState(EMPTY_FORM);
+  const [saving,setSaving]=useState(false);
+  const [loaded,setLoaded]=useState(false);
+
+  useEffect(()=>{(async()=>{try{const r=await window.storage.get("atlas_v3_trades");if(r?.value)setTrades(JSON.parse(r.value));}catch{}setLoaded(true);})();},[]);
+
+  const save=async t=>{try{await window.storage.set("atlas_v3_trades",JSON.stringify(t));}catch{}};
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  const add=async()=>{if(!form.date)return;setSaving(true);const u=[{...form,id:Date.now()},...trades];setTrades(u);await save(u);setForm({...EMPTY_FORM,date:form.date});setSaving(false);};
+  const del=async id=>{const u=trades.filter(t=>t.id!==id);setTrades(u);await save(u);};
+  const stats=calcStats(trades);
+
+  return (
+    <>
+      <div className="greeting-section" style={{paddingBottom:12}}>
+        <div className="greeting-text" style={{fontSize:22}}>Trading Journal</div>
+        <div className="greeting-sub">{trades.length} trade{trades.length!==1?"s":""} logged · Stats auto-calculate</div>
+      </div>
+      <div className="journal-section">
+        {stats&&(
+          <>
+            <div className="journal-stats">
+              <div className="j-stat"><div className={`j-stat-val ${parseFloat(stats.wr)>=50?"teal":"red"}`}>{stats.wr}%</div><div className="j-stat-lbl">Win Rate</div></div>
+              <div className="j-stat"><div className={`j-stat-val ${parseFloat(stats.totalPnl)>=0?"green":"red"}`}>{parseFloat(stats.totalPnl)>=0?"+":""}{stats.totalPnl}</div><div className="j-stat-lbl">Total P&L</div></div>
+              <div className="j-stat"><div className="j-stat-val amber">{stats.avgRR}R</div><div className="j-stat-lbl">Avg R:R</div></div>
+              <div className="j-stat"><div className="j-stat-val blue">{stats.bestPair}</div><div className="j-stat-lbl">Best Pair</div></div>
+              <div className="j-stat"><div className="j-stat-val green">{stats.bestDay}</div><div className="j-stat-lbl">Best Day</div></div>
+              <div className="j-stat"><div className="j-stat-val red">{stats.worstDay}</div><div className="j-stat-lbl">Worst Day</div></div>
+            </div>
+            {stats.pl.length>0&&(
+              <div style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:16,padding:16,marginBottom:16}}>
+                <div className="pair-wr-title">Pair Win Rate</div>
+                {stats.pl.map(p=>(
+                  <div className="pair-wr-row" key={p.pair}>
+                    <span className="pair-wr-name">{p.pair}</span>
+                    <div className="pair-wr-bar-track"><div className="pair-wr-bar-fill" style={{width:`${p.wr}%`}}/></div>
+                    <span className="pair-wr-pct">{p.wr}%</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        <div className="log-form">
+          <div className="log-form-title">◈ Log a Trade</div>
+          <div className="f-row">
+            <div className="f-group"><label className="f-label">Date</label><input type="date" className="f-input" value={form.date} onChange={e=>f("date",e.target.value)}/></div>
+            <div className="f-group"><label className="f-label">Session</label>
+              <select className="f-select" value={form.session} onChange={e=>f("session",e.target.value)}>
+                {["London","New York","Asian","London/NY Overlap"].map(s=><option key={s}>{s}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="f-row">
+            <div className="f-group"><label className="f-label">Pair</label>
+              <select className="f-select" value={form.pair} onChange={e=>f("pair",e.target.value)}>
+                {ALL_AVAILABLE_ASSETS.map(p=><option key={p}>{p}</option>)}
+              </select>
+            </div>
+            <div className="f-group"><label className="f-label">Direction</label>
+              <select className="f-select" value={form.direction} onChange={e=>f("direction",e.target.value)}>
+                <option>Long</option><option>Short</option>
+              </select>
+            </div>
+          </div>
+          <div className="f-row">
+            <div className="f-group"><label className="f-label">Time</label><input type="time" className="f-input" value={form.time} onChange={e=>f("time",e.target.value)}/></div>
+            <div className="f-group"><label className="f-label">Lot Size</label><input type="number" step="any" className="f-input" placeholder="0.10" value={form.lots} onChange={e=>f("lots",e.target.value)}/></div>
+          </div>
+          <div className="f-row">
+            <div className="f-group"><label className="f-label">P&L ($)</label><input type="number" step="any" className="f-input" placeholder="+120" value={form.pnl} onChange={e=>f("pnl",e.target.value)}/></div>
+            <div className="f-group"><label className="f-label">R:R</label><input type="number" step="any" className="f-input" placeholder="2.5" value={form.rr} onChange={e=>f("rr",e.target.value)}/></div>
+          </div>
+          <div className="f-group" style={{marginBottom:10}}>
+            <label className="f-label">Outcome</label>
+            <select className="f-select" value={form.outcome} onChange={e=>f("outcome",e.target.value)}>
+              <option>Win</option><option>Loss</option><option>Breakeven</option>
+            </select>
+          </div>
+          <div className="f-group" style={{marginBottom:12}}>
+            <label className="f-label">Notes</label>
+            <textarea className="f-textarea" placeholder="Setup, confluences, lessons learned…" value={form.notes} onChange={e=>f("notes",e.target.value)}/>
+          </div>
+          <button className="log-btn" onClick={add} disabled={saving}>
+            {saving?<><span className="spin"/>Saving…</>:"+ Log Trade"}
+          </button>
+        </div>
+
+        {!loaded&&<div className="empty-state"><span className="spin-teal"/>Loading…</div>}
+        {loaded&&trades.length===0&&<div className="empty-state">No trades yet. Log your first trade above.</div>}
+        {loaded&&trades.map(t=>(
+          <div className="trade-card" key={t.id}>
+            <div className="tc-top">
+              <div className="tc-pair">{t.pair}</div>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <span className={`tc-pnl ${parseFloat(t.pnl)>=0?"pos":"neg"}`}>
+                  {t.pnl?(parseFloat(t.pnl)>=0?"+":"")+t.pnl:"—"}
+                </span>
+                <button className="tc-del" onClick={()=>del(t.id)}>✕</button>
+              </div>
+            </div>
+            <div className="tc-meta">
+              <span className={`tc-tag ${t.direction.toLowerCase()}`}>{t.direction==="Long"?"▲":"▼"} {t.direction}</span>
+              <span className={`tc-tag ${t.outcome.toLowerCase()}`}>{t.outcome}</span>
+              <span className="tc-tag">{t.session}</span>
+              {t.time&&<span className="tc-tag">⏱ {t.time}</span>}
+              {t.rr&&<span className="tc-tag">{t.rr}R</span>}
+              <span className="tc-tag">{t.date}</span>
+            </div>
+            {t.notes&&<div style={{fontSize:11,color:"var(--text3)",marginTop:8,lineHeight:1.5}}>{t.notes}</div>}
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+  
+  </script>
+  <script>
+    (function() {
+      const sourceEl = document.getElementById('app-source');
+      const code = sourceEl.textContent;
+      const output = Babel.transform(code, {
+        presets: [['react', { runtime: 'classic' }]]
+      }).code;
+      const script = document.createElement('script');
+      script.textContent = output;
+      document.body.appendChild(script);
+    })();
+  </script>
+</body>
+</html>
